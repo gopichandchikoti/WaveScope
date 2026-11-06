@@ -1,0 +1,184 @@
+name: CI
+
+# One pipeline: verify the code, build and check the Android APK, then publish a download.
+#   - Every push to main (or master, until the default branch is renamed) refreshes the "latest-build"
+#     preview release. The README links to a fixed URL, so it never needs editing.
+#   - A version tag such as v1.2.0 publishes an official release. The tag must match package.json.
+#   - Pull requests build and upload the APK as a workflow artifact only. Nothing is published.
+on:
+  push:
+    branches: [main, master]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  # Pushes queue instead of cancelling, so a publish is never cut off half-way.
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  verify:
+    name: Lint, test, build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run lint
+      - run: npm run test:coverage
+      - run: npm run build
+      - run: npm audit --omit=dev
+
+  android:
+    name: Build and verify APK
+    needs: verify
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+          cache: gradle
+      - name: Prepare Android SDK
+        run: |
+          sdkmanager="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          yes | "$sdkmanager" --licenses > /dev/null || true
+          "$sdkmanager" "platforms;android-36" "build-tools;36.0.0"
+      - run: npm ci
+      - name: Work out the version
+        run: |
+          package_version=$(node -p "require('./package.json').version")
+          if [ "$GITHUB_REF_TYPE" = "tag" ]; then
+            tag_version="${GITHUB_REF_NAME#v}"
+            if ! [[ "$tag_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+              echo "::error::Release tags must look like v1.2.3 (got $GITHUB_REF_NAME)."
+              exit 1
+            fi
+            if [ "$tag_version" != "$package_version" ]; then
+              echo "::error::Tag $GITHUB_REF_NAME does not match package.json version $package_version. Bump package.json, commit, then tag."
+              exit 1
+            fi
+            version_name="$package_version"
+          else
+            version_name="${package_version}-build.${GITHUB_RUN_NUMBER}"
+          fi
+          # versionCode must only ever go up or Android refuses to update an installed copy. The run number
+          # does that, provided this workflow file keeps its name (renaming it restarts the count).
+          echo "WAVESCOPE_VERSION_NAME=$version_name" >> "$GITHUB_ENV"
+          echo "WAVESCOPE_VERSION_CODE=$GITHUB_RUN_NUMBER" >> "$GITHUB_ENV"
+          echo "Building $version_name (versionCode $GITHUB_RUN_NUMBER)"
+      - name: Prepare optional signing key
+        if: github.event_name != 'pull_request'
+        env:
+          KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+        run: |
+          if [ -n "$KEYSTORE_BASE64" ]; then
+            keystore="$RUNNER_TEMP/wavescope-preview.jks"
+            printf '%s' "$KEYSTORE_BASE64" | base64 --decode > "$keystore"
+            echo "WAVESCOPE_KEYSTORE_FILE=$keystore" >> "$GITHUB_ENV"
+            echo "Signing with the configured preview key."
+          else
+            echo "No signing secrets configured: the APK uses a throwaway debug key, so Android will not update over an earlier install."
+          fi
+      - name: Build APK
+        env:
+          WAVESCOPE_KEYSTORE_PASSWORD: ${{ github.event_name != 'pull_request' && secrets.ANDROID_KEYSTORE_PASSWORD || '' }}
+          WAVESCOPE_KEY_ALIAS: ${{ github.event_name != 'pull_request' && secrets.ANDROID_KEY_ALIAS || '' }}
+          WAVESCOPE_KEY_PASSWORD: ${{ github.event_name != 'pull_request' && secrets.ANDROID_KEY_PASSWORD || '' }}
+        run: |
+          chmod +x android/gradlew
+          npm run android:build
+      - name: Verify APK
+        run: node scripts/verify-apk.mjs artifacts/wavescope-debug.apk --version-name "$WAVESCOPE_VERSION_NAME" --version-code "$WAVESCOPE_VERSION_CODE"
+      - name: Stage download files
+        run: |
+          mkdir release
+          if [ "$GITHUB_REF_TYPE" = "tag" ]; then name=WaveScope.apk; else name=WaveScope-preview.apk; fi
+          cp artifacts/wavescope-debug.apk "release/$name"
+          (cd release && sha256sum "$name" > "$name.sha256")
+          cp artifacts/build-evidence.json release/build-evidence.json
+          ls -l release
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wavescope-apk
+          path: release/
+          retention-days: 30
+          if-no-files-found: error
+
+  publish:
+    name: Publish download
+    needs: android
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    concurrency:
+      group: publish-download
+      cancel-in-progress: false
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: wavescope-apk
+          path: release
+      - name: Refresh the latest-build preview release
+        if: github.ref_type == 'branch'
+        run: |
+          tag=latest-build
+          # Point the tag at this commit (create it on the first run), then replace the files on its release.
+          if gh api "repos/$GH_REPO/git/ref/tags/$tag" > /dev/null 2>&1; then
+            gh api -X PATCH "repos/$GH_REPO/git/refs/tags/$tag" -f sha="$GITHUB_SHA" -F force=true > /dev/null
+          else
+            gh api -X POST "repos/$GH_REPO/git/refs" -f ref="refs/tags/$tag" -f sha="$GITHUB_SHA" > /dev/null
+          fi
+          version=$(jq -r .versionName release/build-evidence.json)
+          code=$(jq -r .versionCode release/build-evidence.json)
+          signing=$(jq -r .signing release/build-evidence.json)
+          {
+            echo "Preview build of the newest commit on $GITHUB_REF_NAME. Every push replaces this download."
+            echo
+            echo "- Version: $version (versionCode $code)"
+            echo "- Commit: $GITHUB_SHA"
+            echo "- Built by: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+            echo "- Signing: $signing"
+            echo "- SHA-256: $(cut -d' ' -f1 release/WaveScope-preview.apk.sha256)"
+            echo
+            echo "Install: allow installs from your browser or file manager on your Android phone, then open the downloaded file."
+            echo "What WaveScope does and how to use it: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY#readme"
+            echo
+            echo "This is a debug preview, not a store release. If Android refuses to update an earlier install, uninstall the old copy first."
+          } > "$RUNNER_TEMP/notes.txt"
+          files=(release/WaveScope-preview.apk release/WaveScope-preview.apk.sha256)
+          if gh release view "$tag" > /dev/null 2>&1; then
+            gh release edit "$tag" --title "Latest build (preview)" --notes-file "$RUNNER_TEMP/notes.txt" --prerelease
+            gh release upload "$tag" "${files[@]}" --clobber
+          else
+            gh release create "$tag" "${files[@]}" --title "Latest build (preview)" --notes-file "$RUNNER_TEMP/notes.txt" --prerelease --target "$GITHUB_SHA"
+          fi
+      - name: Publish the version release
+        if: github.ref_type == 'tag'
+        run: |
+          tag="$GITHUB_REF_NAME"
+          files=(release/WaveScope.apk release/WaveScope.apk.sha256)
+          if gh release view "$tag" > /dev/null 2>&1; then
+            gh release upload "$tag" "${files[@]}" --clobber
+          else
+            gh release create "$tag" "${files[@]}" --title "WaveScope ${tag#v}" --generate-notes --verify-tag
+          fi
