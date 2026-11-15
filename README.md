@@ -5,6 +5,7 @@
 **A private, one-stop toolkit for testing your internet connection, your Wi-Fi and your router.**
 
 Press one button to measure download and upload speed, latency, jitter, DNS time and how much your connection slows down under load. Look at the Wi-Fi you are on and the networks around you. Run individual ping, DNS and HTTPS checks against any host. Everything runs on your own device, results stay on your device, and nothing is measured until you ask.
+**Live demo:** https://wave-scope.vercel.app
 
 ![WaveScope Overview with a completed speed test](docs/screenshots/overview-speed-test.png)
 
